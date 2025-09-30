@@ -1,0 +1,17 @@
+# Configuration files (contain sensitive data)
+smtp.json
+rate_limit.json
+
+# Email content files
+*.html
+letter.html
+
+# Recipient files (contain email addresses)
+*.txt
+recipients.txt
+test_recipient.txt
+subject.txt
+
+# Python cache files
+__pycache__/
+*.pyc
