@@ -19,23 +19,51 @@ from models import SMTPCredentials
 # File reading utilities
 # ----------------------------------------------------------------------
 
-def load_smtp_config(file_path: str = "smtp.json") -> SMTPCredentials:
-    """Load SMTP configuration from JSON file."""
+def load_smtp_config(file_path: str = "smtp.json") -> List[SMTPCredentials]:
+    """Load SMTP configuration(s) from JSON file. Supports single config or array of configs."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"SMTP config file not found: {file_path}")
     
     with open(file_path, 'r', encoding='utf-8') as f:
-        config = json.load(f)
+        config_data = json.load(f)
     
-    return SMTPCredentials(
-        host=config["host"],
-        port=config["port"],
-        username=config["username"],
-        password=config["password"],
-        encryption=config["encryption"],
-        from_address=config["from_address"],
-        from_name=config["from_name"]
-    )
+    # Handle both single config and array of configs
+    if isinstance(config_data, list):
+        # Multiple SMTP configurations
+        smtp_configs = []
+        for i, config in enumerate(config_data):
+            try:
+                smtp_configs.append(SMTPCredentials(
+                    host=config["host"],
+                    port=config["port"],
+                    username=config["username"],
+                    password=config["password"],
+                    encryption=config["encryption"],
+                    from_address=config["from_address"],
+                    from_name=config["from_name"]
+                ))
+            except KeyError as e:
+                logging.error(f"Missing key {e} in SMTP config #{i+1}, skipping")
+                continue
+        
+        if not smtp_configs:
+            raise ValueError("No valid SMTP configurations found")
+        
+        logging.info(f"Loaded {len(smtp_configs)} SMTP configuration(s)")
+        return smtp_configs
+    else:
+        # Single SMTP configuration
+        smtp_config = SMTPCredentials(
+            host=config_data["host"],
+            port=config_data["port"],
+            username=config_data["username"],
+            password=config_data["password"],
+            encryption=config_data["encryption"],
+            from_address=config_data["from_address"],
+            from_name=config_data["from_name"]
+        )
+        logging.info("Loaded 1 SMTP configuration")
+        return [smtp_config]
 
 
 def load_recipients(file_path: str = "recipients.txt") -> List[str]:
@@ -92,28 +120,68 @@ def load_letter_html(file_path: str = "letter.html") -> str:
 
 def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
     """Load rate limiting configuration from JSON file."""
+    defaults = {
+        "emails_per_batch": 1,
+        "seconds_per_batch": 1,
+        "connection": 1,
+        "wait_before_sending": 0.5,
+        "retry_if_error": 3,
+        "rotate_per_smtp": 100
+    }
+    
     if not os.path.exists(file_path):
         logging.warning(f"Rate limit config file not found: {file_path}, using defaults")
-        return {"emails_per_batch": 1, "seconds_per_batch": 1}
+        return defaults
     
     with open(file_path, 'r', encoding='utf-8') as f:
         config = json.load(f)
     
-    # Validate configuration
-    emails_per_batch = config.get("emails_per_batch", 1)
-    seconds_per_batch = config.get("seconds_per_batch", 1)
+    # Validate configuration with defaults
+    emails_per_batch = config.get("emails_per_batch", defaults["emails_per_batch"])
+    seconds_per_batch = config.get("seconds_per_batch", defaults["seconds_per_batch"])
+    connection = config.get("connection", defaults["connection"])
+    wait_before_sending = config.get("wait_before_sending", defaults["wait_before_sending"])
+    retry_if_error = config.get("retry_if_error", defaults["retry_if_error"])
+    rotate_per_smtp = config.get("rotate_per_smtp", defaults["rotate_per_smtp"])
     
+    # Validate values
     if emails_per_batch <= 0:
-        logging.warning("emails_per_batch must be positive, using default value 1")
-        emails_per_batch = 1
+        logging.warning("emails_per_batch must be positive, using default value")
+        emails_per_batch = defaults["emails_per_batch"]
     
     if seconds_per_batch < 0:
-        logging.warning("seconds_per_batch cannot be negative, using default value 1")
-        seconds_per_batch = 1
+        logging.warning("seconds_per_batch cannot be negative, using default value")
+        seconds_per_batch = defaults["seconds_per_batch"]
+    
+    if connection <= 0:
+        logging.warning("connection must be positive, using default value")
+        connection = defaults["connection"]
+    elif connection > 10:
+        logging.warning("connection should not exceed 10 for stability, using 10")
+        connection = 10
+    
+    if wait_before_sending < 0:
+        logging.warning("wait_before_sending cannot be negative, using default value")
+        wait_before_sending = defaults["wait_before_sending"]
+    
+    if retry_if_error < 0:
+        logging.warning("retry_if_error cannot be negative, using default value")
+        retry_if_error = defaults["retry_if_error"]
+    elif retry_if_error > 10:
+        logging.warning("retry_if_error should not exceed 10, using 10")
+        retry_if_error = 10
+    
+    if rotate_per_smtp <= 0:
+        logging.warning("rotate_per_smtp must be positive, using default value")
+        rotate_per_smtp = defaults["rotate_per_smtp"]
     
     return {
         "emails_per_batch": emails_per_batch,
-        "seconds_per_batch": seconds_per_batch
+        "seconds_per_batch": seconds_per_batch,
+        "connection": connection,
+        "wait_before_sending": wait_before_sending,
+        "retry_if_error": retry_if_error,
+        "rotate_per_smtp": rotate_per_smtp
     }
 
 
@@ -147,6 +215,78 @@ def create_html_email_message(from_addr: str, from_name: str, to_addr: str, subj
     return msg
 
 
+async def send_html_email_with_retry(
+    smtp_config: SMTPCredentials,
+    to_addr: str,
+    subject: str,
+    html_content: str,
+    retry_count: int = 3,
+    connection_semaphore: asyncio.Semaphore = None,
+    use_tls: bool = True,
+    timeout: float = 30.0,
+) -> dict:
+    """Send HTML email with retry mechanism and connection limiting."""
+    last_error = None
+    
+    for attempt in range(retry_count + 1):  # +1 for initial attempt
+        try:
+            # Use connection semaphore if provided
+            if connection_semaphore:
+                async with connection_semaphore:
+                    result = await _send_single_email(smtp_config, to_addr, subject, html_content, use_tls, timeout)
+            else:
+                result = await _send_single_email(smtp_config, to_addr, subject, html_content, use_tls, timeout)
+            
+            if result["success"]:
+                if attempt > 0:
+                    result["retry_attempts"] = attempt
+                return result
+            else:
+                last_error = result
+                
+        except Exception as e:
+            last_error = {"success": False, "error": str(e), "error_type": type(e).__name__, "duration_seconds": 0}
+        
+        # Wait before retry (exponential backoff)
+        if attempt < retry_count:
+            wait_time = min(2 ** attempt, 30)  # Cap at 30 seconds
+            await asyncio.sleep(wait_time)
+    
+    # All retries failed
+    if last_error:
+        last_error["retry_attempts"] = retry_count
+        return last_error
+    else:
+        return {"success": False, "error": "Unknown error after retries", "retry_attempts": retry_count, "duration_seconds": 0}
+
+
+async def _send_single_email(
+    smtp_config: SMTPCredentials,
+    to_addr: str,
+    subject: str,
+    html_content: str,
+    use_tls: bool = True,
+    timeout: float = 30.0,
+) -> dict:
+    """Internal function to send a single email."""
+    start_time = datetime.now()
+    try:
+        message = create_html_email_message(smtp_config.from_address, smtp_config.from_name, to_addr, subject, html_content)
+        smtp = aiosmtplib.SMTP(hostname=smtp_config.host, port=smtp_config.port, timeout=timeout, use_tls=False, start_tls=False)
+        await smtp.connect()
+        if use_tls:
+            await smtp.starttls()
+        await smtp.login(smtp_config.username, smtp_config.password)
+        await smtp.send_message(message)
+        await smtp.quit()
+        duration = (datetime.now() - start_time).total_seconds()
+        return {"success": True, "message": f"Email sent to {to_addr}", "duration_seconds": duration, "mode": "STARTTLS"}
+    except Exception as e:
+        duration = (datetime.now() - start_time).total_seconds()
+        return {"success": False, "error": str(e), "error_type": type(e).__name__, "duration_seconds": duration}
+
+
+# Legacy function for backward compatibility
 async def send_html_email_directly(
     host: str,
     port: int,
@@ -160,74 +300,81 @@ async def send_html_email_directly(
     use_tls: bool = True,
     timeout: float = 30.0,
 ) -> dict:
-    """Send HTML email using aiosmtplib."""
-    start_time = datetime.now()
-    try:
-        message = create_html_email_message(from_addr, from_name, to_addr, subject, html_content)
-        smtp = aiosmtplib.SMTP(hostname=host, port=port, timeout=timeout, use_tls=False, start_tls=False)
-        await smtp.connect()
-        if use_tls:
-            await smtp.starttls()
-        await smtp.login(username, password)
-        await smtp.send_message(message)
-        await smtp.quit()
-        duration = (datetime.now() - start_time).total_seconds()
-        return {"success": True, "message": f"Email sent to {to_addr}", "duration_seconds": duration, "mode": "STARTTLS"}
-    except Exception as e:
-        duration = (datetime.now() - start_time).total_seconds()
-        return {"success": False, "error": str(e), "error_type": type(e).__name__, "duration_seconds": duration}
+    """Legacy function - creates SMTPCredentials and calls new function."""
+    smtp_config = SMTPCredentials(host, port, username, password, "tls", from_addr, from_name)
+    return await _send_single_email(smtp_config, to_addr, subject, html_content, use_tls, timeout)
 
 
-async def send_test_email(smtp_config: SMTPCredentials, test_recipient: str, subject: str, html_content: str, test_number: int) -> bool:
+async def send_test_email(smtp_config: SMTPCredentials, test_recipient: str, subject: str, html_content: str, test_number: int, retry_count: int = 3) -> bool:
     """Send a test email to verify connection is still working."""
     test_subject = f"[TEST #{test_number}] {subject}"
     
     print(f"  🧪 Sending test email #{test_number} to: {test_recipient}")
     
-    result = await send_html_email_directly(
-        host=smtp_config.host,
-        port=smtp_config.port,
-        username=smtp_config.username,
-        password=smtp_config.password,
-        from_addr=smtp_config.from_address,
-        from_name=smtp_config.from_name,
+    result = await send_html_email_with_retry(
+        smtp_config=smtp_config,
         to_addr=test_recipient,
         subject=test_subject,
         html_content=html_content,
+        retry_count=retry_count
     )
     
     if result["success"]:
-        print(f"  ✅ Test email SUCCESS - Duration: {result['duration_seconds']:.2f}s")
+        retry_info = f" (after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
+        print(f"  ✅ Test email SUCCESS{retry_info} - Duration: {result['duration_seconds']:.2f}s")
         return True
     else:
-        print(f"  ❌ Test email FAILED - {result['error_type']}: {result['error']}")
+        retry_info = f" (failed after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
+        print(f"  ❌ Test email FAILED{retry_info} - {result['error_type']}: {result['error']}")
         return False
 
 
-async def send_emails_with_rate_limit(smtp_config: SMTPCredentials, recipients: List[str], subject: str, html_content: str, rate_config: dict, test_recipient: str):
-    """Send emails to all recipients with configurable rate limiting and test emails every 500 sends."""
+async def send_emails_with_advanced_features(
+    smtp_configs: List[SMTPCredentials], 
+    recipients: List[str], 
+    subject: str, 
+    html_content: str, 
+    rate_config: dict, 
+    test_recipient: str
+):
+    """Send emails with all advanced features: connection pooling, retries, rotation, rate limiting."""
+    # Extract configuration
     emails_per_batch = rate_config["emails_per_batch"]
     seconds_per_batch = rate_config["seconds_per_batch"]
+    connection_pool_size = rate_config["connection"]
+    wait_before_sending = rate_config["wait_before_sending"]
+    retry_if_error = rate_config["retry_if_error"]
+    rotate_per_smtp = rate_config["rotate_per_smtp"]
     
-    print(f"Starting email campaign to {len(recipients)} recipients...")
-    print(f"Rate limit: {emails_per_batch} email(s) every {seconds_per_batch} second(s)")
+    # Create connection semaphore for limiting concurrent connections
+    connection_semaphore = asyncio.Semaphore(connection_pool_size)
+    
+    print(f"Starting advanced email campaign to {len(recipients)} recipients...")
+    print(f"SMTP accounts: {len(smtp_configs)}")
+    print(f"Connection pool: {connection_pool_size} simultaneous connections")
+    print(f"Rate limit: {emails_per_batch} email(s) every {seconds_per_batch}s")
+    print(f"Individual delay: {wait_before_sending}s before each email")
+    print(f"Retry attempts: {retry_if_error}")
+    print(f"SMTP rotation: Every {rotate_per_smtp} emails")
     print(f"Test email: Every 500 emails to {test_recipient}")
-    print("=" * 60)
+    print("=" * 80)
     
     successful_sends = 0
     failed_sends = 0
     test_count = 0
+    current_smtp_index = 0
     
     for i, recipient in enumerate(recipients, 1):
         # Send test email every 500 regular emails
         if i % 500 == 0:
             test_count += 1
-            test_success = await send_test_email(smtp_config, test_recipient, subject, html_content, test_count)
+            current_smtp = smtp_configs[current_smtp_index % len(smtp_configs)]
+            test_success = await send_test_email(current_smtp, test_recipient, subject, html_content, test_count, retry_if_error)
             
             if not test_success:
                 print(f"\n❌ TEST EMAIL FAILED! Stopping campaign at email #{i}")
                 print(f"Last successful position: {i-1}")
-                print("=" * 60)
+                print("=" * 80)
                 print(f"Campaign STOPPED due to test email failure!")
                 print(f"Successful sends: {successful_sends}")
                 print(f"Failed sends: {failed_sends}")
@@ -236,41 +383,60 @@ async def send_emails_with_rate_limit(smtp_config: SMTPCredentials, recipients: 
             
             print(f"  ✅ Test passed, continuing with regular emails...")
         
-        print(f"[{i}/{len(recipients)}] Sending to: {recipient}")
+        # Rotate SMTP account if needed
+        if i % rotate_per_smtp == 0 and len(smtp_configs) > 1:
+            current_smtp_index = (current_smtp_index + 1) % len(smtp_configs)
+            current_smtp = smtp_configs[current_smtp_index]
+            print(f"  🔄 Rotated to SMTP account #{current_smtp_index + 1}: {current_smtp.host}")
+        else:
+            current_smtp = smtp_configs[current_smtp_index % len(smtp_configs)]
         
-        result = await send_html_email_directly(
-            host=smtp_config.host,
-            port=smtp_config.port,
-            username=smtp_config.username,
-            password=smtp_config.password,
-            from_addr=smtp_config.from_address,
-            from_name=smtp_config.from_name,
+        print(f"[{i}/{len(recipients)}] Sending to: {recipient} (SMTP #{current_smtp_index + 1})")
+        
+        # Apply individual email delay before sending
+        if wait_before_sending > 0:
+            await asyncio.sleep(wait_before_sending)
+        
+        # Send email with retry and connection pooling
+        result = await send_html_email_with_retry(
+            smtp_config=current_smtp,
             to_addr=recipient,
             subject=subject,
             html_content=html_content,
+            retry_count=retry_if_error,
+            connection_semaphore=connection_semaphore
         )
         
         if result["success"]:
             successful_sends += 1
-            print(f"  ✓ Success - Duration: {result['duration_seconds']:.2f}s")
+            retry_info = f" (after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
+            print(f"  ✓ Success{retry_info} - Duration: {result['duration_seconds']:.2f}s")
         else:
             failed_sends += 1
-            print(f"  ✗ Failed - {result['error_type']}: {result['error']}")
+            retry_info = f" (failed after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
+            print(f"  ✗ Failed{retry_info} - {result['error_type']}: {result['error']}")
         
-        # Apply rate limiting - wait after sending a batch of emails
+        # Apply batch rate limiting
         if i % emails_per_batch == 0 and i < len(recipients):
             if seconds_per_batch > 0:
-                print(f"  ⏳ Rate limiting: waiting {seconds_per_batch} second(s)...")
+                print(f"  ⏳ Batch rate limiting: waiting {seconds_per_batch} second(s)...")
                 await asyncio.sleep(seconds_per_batch)
     
-    print("=" * 60)
+    print("=" * 80)
     print(f"Campaign completed successfully!")
     print(f"Successful sends: {successful_sends}")
     print(f"Failed sends: {failed_sends}")
     print(f"Total recipients: {len(recipients)}")
     print(f"Test emails sent: {test_count}")
-    print(f"Rate limit used: {emails_per_batch} email(s) every {seconds_per_batch} second(s)")
+    print(f"SMTP accounts used: {len(smtp_configs)}")
+    print(f"Final SMTP account: #{current_smtp_index + 1}")
     return True
+
+
+# Backward compatibility wrapper
+async def send_emails_with_rate_limit(smtp_config: SMTPCredentials, recipients: List[str], subject: str, html_content: str, rate_config: dict, test_recipient: str):
+    """Legacy wrapper function for backward compatibility."""
+    return await send_emails_with_advanced_features([smtp_config], recipients, subject, html_content, rate_config, test_recipient)
 
 
 # ----------------------------------------------------------------------
@@ -288,24 +454,32 @@ async def main():
     try:
         # Load configuration files
         print("Loading configuration files...")
-        smtp_config = load_smtp_config()
+        smtp_configs = load_smtp_config()
         recipients = load_recipients()
         subject = load_subject()
         html_content = load_letter_html()
         rate_config = load_rate_limit_config()
         test_recipient = load_test_recipient()
         
-        print(f"SMTP Server: {smtp_config.host}:{smtp_config.port}")
-        print(f"From: {smtp_config.from_name} <{smtp_config.from_address}>")
+        # Display configuration summary
+        print(f"SMTP accounts: {len(smtp_configs)}")
+        for i, config in enumerate(smtp_configs, 1):
+            print(f"  #{i}: {config.from_name} <{config.from_address}> via {config.host}:{config.port}")
         print(f"Subject: {subject}")
         print(f"Recipients loaded: {len(recipients)}")
         print(f"Test recipient: {test_recipient}")
-        print(f"Encryption: {smtp_config.encryption}")
-        print(f"Rate limit: {rate_config['emails_per_batch']} email(s) every {rate_config['seconds_per_batch']} second(s)")
+        print(f"Advanced features:")
+        print(f"  - Connection pool: {rate_config['connection']} simultaneous connections")
+        print(f"  - Retry attempts: {rate_config['retry_if_error']}")
+        print(f"  - Individual delay: {rate_config['wait_before_sending']}s")
+        print(f"  - SMTP rotation: Every {rate_config['rotate_per_smtp']} emails")
+        print(f"  - Batch rate limit: {rate_config['emails_per_batch']} email(s) every {rate_config['seconds_per_batch']}s")
         print()
         
-        # Start email campaign
-        campaign_success = await send_emails_with_rate_limit(smtp_config, recipients, subject, html_content, rate_config, test_recipient)
+        # Start advanced email campaign
+        campaign_success = await send_emails_with_advanced_features(
+            smtp_configs, recipients, subject, html_content, rate_config, test_recipient
+        )
         
         if not campaign_success:
             print("\n⚠️  Campaign was stopped due to test email failure.")
