@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from email.message import EmailMessage
 from typing import List
@@ -67,13 +68,28 @@ def load_smtp_config(file_path: str = "smtp.json") -> List[SMTPCredentials]:
 
 
 def load_recipients(file_path: str = "recipients.txt") -> List[str]:
-    """Load recipient email addresses from text file, removing duplicates and already sent emails."""
+    """Load recipient email addresses, removing duplicates and already sent emails (except test recipients)."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Recipients file not found: {file_path}")
     
-    # Load previously sent emails and test recipient for exclusion logic
+    # Load previously sent emails and ALL test recipients for exclusion logic
     sent_emails = load_sent_emails()
-    test_recipient = load_test_recipient().lower() if os.path.exists("test_recipient.txt") else "rahamtulla9@rediffmail.com".lower()
+    
+    # Load ALL test recipients from test_recipient.txt
+    test_recipients = set()
+    if os.path.exists("test_recipient.txt"):
+        try:
+            with open("test_recipient.txt", 'r', encoding='utf-8') as f:
+                for line in f:
+                    email = line.strip()
+                    if email and '@' in email:
+                        test_recipients.add(email.lower())
+        except Exception as e:
+            logging.error(f"Error reading test recipients: {e}")
+    
+    # Add default test recipient if no file exists or file is empty
+    if not test_recipients:
+        test_recipients.add("rahamtulla9@rediffmail.com")
     
     # First, read all recipients including duplicates
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -85,30 +101,35 @@ def load_recipients(file_path: str = "recipients.txt") -> List[str]:
     unique_recipients = []
     seen = set()
     already_sent_count = 0
+    duplicates_in_batch = 0
     
     for email in all_recipients:
         email_lower = email.lower()
         
-        # Skip if we've already seen this email in current batch
-        if email_lower in seen:
+        # Check if this email is a test recipient (bypass all filtering)
+        is_test_recipient = email_lower in test_recipients
+        
+        # Skip if we've already seen this email in current batch (except test recipients)
+        if email_lower in seen and not is_test_recipient:
+            duplicates_in_batch += 1
             continue
             
-        # Check if email was already sent (except test recipient)
-        if email_lower in sent_emails and email_lower != test_recipient:
+        # Check if email was already sent (except test recipients)
+        if email_lower in sent_emails and not is_test_recipient:
             already_sent_count += 1
             continue
             
         unique_recipients.append(email)
         seen.add(email_lower)
     
-    duplicates_removed = original_count - len(unique_recipients) - already_sent_count
-    
     # Log the filtering results
-    if duplicates_removed > 0 or already_sent_count > 0:
-        if duplicates_removed > 0:
-            logging.info(f"Removed {duplicates_removed} duplicate email(s) from recipients list")
+    if duplicates_in_batch > 0 or already_sent_count > 0:
+        if duplicates_in_batch > 0:
+            logging.info(f"Removed {duplicates_in_batch} duplicate email(s) from recipients list")
         if already_sent_count > 0:
             logging.info(f"Excluded {already_sent_count} already sent email(s) from recipients list")
+        if len(test_recipients) > 0:
+            logging.info(f"Protected {len(test_recipients)} test recipient(s) from filtering: {', '.join(test_recipients)}")
         
         # Update the file with filtered recipients
         with open(file_path, 'w', encoding='utf-8') as f:
@@ -475,13 +496,47 @@ class SMTPConnectionPool:
 # Email sending functions
 # ----------------------------------------------------------------------
 
+def html_to_plain_text(html_content: str) -> str:
+    """Convert HTML content to plain text for text/plain MIME part."""
+    # Remove HTML tags
+    text = re.sub(r'<[^>]+>', '', html_content)
+    
+    # Convert common HTML entities
+    text = text.replace('&nbsp;', ' ')
+    text = text.replace('&amp;', '&')
+    text = text.replace('&lt;', '<')
+    text = text.replace('&gt;', '>')
+    text = text.replace('&quot;', '"')
+    text = text.replace('&#39;', "'")
+    
+    # Clean up whitespace
+    text = re.sub(r'\n\s*\n', '\n\n', text)  # Remove excessive blank lines
+    text = re.sub(r'[ \t]+', ' ', text)      # Normalize spaces
+    text = text.strip()
+    
+    return text
+
+
 def create_html_email_message(from_addr: str, from_name: str, to_addr: str, subject: str, html_content: str) -> EmailMessage:
-    """Create HTML email message."""
+    """Create email message with both HTML and plain text versions for better deliverability."""
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{from_name} <{from_addr}>"
     msg["To"] = to_addr
-    msg.set_content(html_content, subtype="html")
+    
+    # Add List-Unsubscribe header (required for bulk email)
+    # This allows recipients to easily unsubscribe from your mailing list
+    unsubscribe_email = f"unsubscribe+{to_addr.replace('@', '=').replace('.', '_')}@{from_addr.split('@')[1]}"
+    msg["List-Unsubscribe"] = f"<mailto:{unsubscribe_email}>, <https://unsubscribe.example.com/?email={to_addr}>"
+    msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    
+    # Create plain text version from HTML
+    plain_text = html_to_plain_text(html_content)
+    
+    # Set both plain text and HTML content (multipart/alternative)
+    msg.set_content(plain_text)  # Plain text as primary content
+    msg.add_alternative(html_content, subtype="html")  # HTML as alternative
+    
     return msg
 
 
