@@ -67,9 +67,13 @@ def load_smtp_config(file_path: str = "smtp.json") -> List[SMTPCredentials]:
 
 
 def load_recipients(file_path: str = "recipients.txt") -> List[str]:
-    """Load recipient email addresses from text file (one per line), removing duplicates."""
+    """Load recipient email addresses from text file, removing duplicates and already sent emails."""
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Recipients file not found: {file_path}")
+    
+    # Load previously sent emails and test recipient for exclusion logic
+    sent_emails = load_sent_emails()
+    test_recipient = load_test_recipient().lower() if os.path.exists("test_recipient.txt") else "rahamtulla9@rediffmail.com".lower()
     
     # First, read all recipients including duplicates
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -77,25 +81,42 @@ def load_recipients(file_path: str = "recipients.txt") -> List[str]:
     
     original_count = len(all_recipients)
     
-    # Remove duplicates while preserving order
+    # Remove duplicates and already sent emails while preserving order
     unique_recipients = []
     seen = set()
+    already_sent_count = 0
+    
     for email in all_recipients:
-        if email.lower() not in seen:  # Case-insensitive duplicate check
-            unique_recipients.append(email)
-            seen.add(email.lower())
+        email_lower = email.lower()
+        
+        # Skip if we've already seen this email in current batch
+        if email_lower in seen:
+            continue
+            
+        # Check if email was already sent (except test recipient)
+        if email_lower in sent_emails and email_lower != test_recipient:
+            already_sent_count += 1
+            continue
+            
+        unique_recipients.append(email)
+        seen.add(email_lower)
     
-    duplicates_removed = original_count - len(unique_recipients)
+    duplicates_removed = original_count - len(unique_recipients) - already_sent_count
     
-    if duplicates_removed > 0:
-        logging.info(f"Removed {duplicates_removed} duplicate email(s) from recipients list")
-        # Update the file with unique recipients
+    # Log the filtering results
+    if duplicates_removed > 0 or already_sent_count > 0:
+        if duplicates_removed > 0:
+            logging.info(f"Removed {duplicates_removed} duplicate email(s) from recipients list")
+        if already_sent_count > 0:
+            logging.info(f"Excluded {already_sent_count} already sent email(s) from recipients list")
+        
+        # Update the file with filtered recipients
         with open(file_path, 'w', encoding='utf-8') as f:
             for email in unique_recipients:
                 f.write(email + '\n')
-        logging.info(f"Updated {file_path} with {len(unique_recipients)} unique recipients")
+        logging.info(f"Updated {file_path} with {len(unique_recipients)} recipients to send")
     else:
-        logging.info("No duplicate emails found in recipients list")
+        logging.info("No duplicate or already sent emails found in recipients list")
     
     return unique_recipients
 
@@ -179,6 +200,21 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
     }
 
 
+def load_sent_emails(file_path: str = "send_success.txt") -> set:
+    """Load previously sent email addresses from success file."""
+    sent_emails = set()
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    email = line.strip()
+                    if email:
+                        sent_emails.add(email.lower())  # Case-insensitive
+        except Exception as e:
+            logging.error(f"Error reading sent emails from {file_path}: {e}")
+    return sent_emails
+
+
 def load_test_recipient(file_path: str = "test_recipient.txt") -> str:
     """Load test recipient email address from text file."""
     if not os.path.exists(file_path):
@@ -235,15 +271,48 @@ def save_failed_recipient(email: str, error_info: str, file_path: str = "failed_
         logging.error(f"Error logging failed recipient {email}: {e}")
 
 
-def save_successful_recipient(email: str, smtp_info: str, file_path: str = "send_success.txt"):
-    """Save successfully sent emails to a tracking file."""
+def save_successful_recipient(email: str, smtp_info: str = None, file_path: str = "send_success.txt"):
+    """Save successfully sent emails to a tracking file (email addresses only)."""
     try:
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(file_path, 'a', encoding='utf-8') as f:
-            f.write(f"{timestamp} | {email} | {smtp_info}\n")
+            f.write(f"{email}\n")
         logging.info(f"Logged successful send for {email} to {file_path}")
     except Exception as e:
         logging.error(f"Error logging successful recipient {email}: {e}")
+
+
+def generate_statistics(smtp_stats: dict, smtp_configs: List[SMTPCredentials], file_path: str = "statistics.txt"):
+    """Generate statistics about SMTP usage and save to file."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(f"SMTP Email Campaign Statistics\n")
+            f.write(f"Generated: {timestamp}\n")
+            f.write(f"=" * 50 + "\n\n")
+            
+            total_sent = sum(smtp_stats.values())
+            f.write(f"Total emails sent: {total_sent}\n\n")
+            
+            f.write(f"SMTP Account Usage:\n")
+            f.write(f"-" * 30 + "\n")
+            
+            for i, smtp_config in enumerate(smtp_configs):
+                conn_id = f"conn_{i+1}"
+                count = smtp_stats.get(conn_id, 0)
+                percentage = (count / total_sent * 100) if total_sent > 0 else 0
+                
+                f.write(f"SMTP #{i+1}: {smtp_config.host}\n")
+                f.write(f"  From: {smtp_config.from_name} <{smtp_config.from_address}>\n")
+                f.write(f"  Emails sent: {count} ({percentage:.1f}%)\n")
+                f.write(f"\n")
+        
+        logging.info(f"Statistics saved to {file_path}")
+        print(f"📊 Campaign statistics saved to {file_path}")
+        
+    except Exception as e:
+        logging.error(f"Error generating statistics: {e}")
+        print(f"⚠️  Error generating statistics: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -259,6 +328,7 @@ class SMTPConnectionPool:
         self.connections = []
         self.current_index = 0
         self.lock = asyncio.Lock()
+        self.smtp_stats = {}  # Track emails sent per connection
         
     async def initialize(self):
         """Initialize the connection pool."""
@@ -367,6 +437,10 @@ class SMTPConnectionPool:
             await conn['smtp'].send_message(message)
             duration = (datetime.now() - start_time).total_seconds()
             
+            # Track statistics
+            conn_key = f"conn_{conn['id']}"
+            self.smtp_stats[conn_key] = self.smtp_stats.get(conn_key, 0) + 1
+            
             return {
                 "success": True, 
                 "message": f"Email sent to {to_addr}", 
@@ -463,7 +537,7 @@ async def send_html_email_with_retry(
 
 async def send_test_email(connection_pool: SMTPConnectionPool, test_recipient: str, subject: str, html_content: str, test_number: int, retry_count: int = 3) -> bool:
     """Send a test email to verify connection is still working."""
-    test_subject = f"[TEST #{test_number}] {subject}"
+    test_subject = subject  # Use the exact same subject as regular emails
     
     print(f"  🧪 Sending test email #{test_number} to: {test_recipient}")
     
@@ -573,8 +647,7 @@ async def send_emails_with_advanced_features(
                 print(f"  📝 Removed {recipient} from recipients list")
                 
                 # Log successful email to success tracking file
-                smtp_info = f"Connection #{result.get('connection_id', '?')}: {result.get('mode', 'POOLED')}"
-                save_successful_recipient(recipient, smtp_info)
+                save_successful_recipient(recipient)
                 print(f"  ✅ Logged success to send_success.txt")
             else:
                 failed_sends += 1
@@ -595,6 +668,9 @@ async def send_emails_with_advanced_features(
         print(f"Total recipients processed: {len(recipients)}")
         print(f"Test emails sent: {test_count}")
         print(f"SMTP connection pool: {len(connection_pool.connections)} persistent connections")
+        
+        # Generate statistics
+        generate_statistics(connection_pool.smtp_stats, smtp_configs)
         
         # Show remaining recipients count
         try:
