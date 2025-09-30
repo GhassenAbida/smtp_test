@@ -124,7 +124,8 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
         "connection": 3,
         "wait_before_sending": 1.0,
         "retry_if_error": 3,
-        "rotate_per_smtp": 100
+        "rotate_per_smtp": 100,
+        "test_index": 500
     }
     
     if not os.path.exists(file_path):
@@ -139,6 +140,7 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
     wait_before_sending = config.get("wait_before_sending", defaults["wait_before_sending"])
     retry_if_error = config.get("retry_if_error", defaults["retry_if_error"])
     rotate_per_smtp = config.get("rotate_per_smtp", defaults["rotate_per_smtp"])
+    test_index = config.get("test_index", defaults["test_index"])
     
     # Validate values
     
@@ -164,11 +166,16 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
         logging.warning("rotate_per_smtp must be positive, using default value")
         rotate_per_smtp = defaults["rotate_per_smtp"]
     
+    if test_index <= 0:
+        logging.warning("test_index must be positive, using default value")
+        test_index = defaults["test_index"]
+    
     return {
         "connection": connection,
         "wait_before_sending": wait_before_sending,
         "retry_if_error": retry_if_error,
-        "rotate_per_smtp": rotate_per_smtp
+        "rotate_per_smtp": rotate_per_smtp,
+        "test_index": test_index
     }
 
 
@@ -494,6 +501,7 @@ async def send_emails_with_advanced_features(
     wait_before_sending = rate_config["wait_before_sending"]
     retry_if_error = rate_config["retry_if_error"]
     rotate_per_smtp = rate_config["rotate_per_smtp"]
+    test_index = rate_config["test_index"]
     
     print(f"Starting advanced email campaign to {len(recipients)} recipients...")
     print(f"SMTP accounts: {len(smtp_configs)}")
@@ -501,7 +509,7 @@ async def send_emails_with_advanced_features(
     print(f"Individual delay: {wait_before_sending}s before each email")
     print(f"Retry attempts: {retry_if_error}")
     print(f"SMTP rotation: Every {rotate_per_smtp} emails")
-    print(f"Test email: Every 500 emails to {test_recipient}")
+    print(f"Test email: Every {test_index} emails to {test_recipient}")
     print("=" * 80)
     
     # Initialize SMTP connection pool
@@ -519,8 +527,8 @@ async def send_emails_with_advanced_features(
         current_smtp_index = 0
     
         for i, recipient in enumerate(recipients, 1):
-            # Send test email every 500 regular emails
-            if i % 500 == 0:
+            # Send test email every N regular emails (configurable)
+            if i % test_index == 0:
                 test_count += 1
                 test_success = await send_test_email(connection_pool, test_recipient, subject, html_content, test_count, retry_if_error)
                 
@@ -643,6 +651,7 @@ async def main():
         print(f"  - Retry attempts: {rate_config['retry_if_error']}")
         print(f"  - Individual delay: {rate_config['wait_before_sending']}s")
         print(f"  - SMTP rotation: Every {rate_config['rotate_per_smtp']} emails")
+        print(f"  - Test frequency: Every {rate_config['test_index']} emails")
         print()
         
         # Start advanced email campaign
