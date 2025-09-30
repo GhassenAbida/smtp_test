@@ -121,10 +121,8 @@ def load_letter_html(file_path: str = "letter.html") -> str:
 def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
     """Load rate limiting configuration from JSON file."""
     defaults = {
-        "emails_per_batch": 1,
-        "seconds_per_batch": 1,
-        "connection": 1,
-        "wait_before_sending": 0.5,
+        "connection": 3,
+        "wait_before_sending": 1.0,
         "retry_if_error": 3,
         "rotate_per_smtp": 100
     }
@@ -137,21 +135,12 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
         config = json.load(f)
     
     # Validate configuration with defaults
-    emails_per_batch = config.get("emails_per_batch", defaults["emails_per_batch"])
-    seconds_per_batch = config.get("seconds_per_batch", defaults["seconds_per_batch"])
     connection = config.get("connection", defaults["connection"])
     wait_before_sending = config.get("wait_before_sending", defaults["wait_before_sending"])
     retry_if_error = config.get("retry_if_error", defaults["retry_if_error"])
     rotate_per_smtp = config.get("rotate_per_smtp", defaults["rotate_per_smtp"])
     
     # Validate values
-    if emails_per_batch <= 0:
-        logging.warning("emails_per_batch must be positive, using default value")
-        emails_per_batch = defaults["emails_per_batch"]
-    
-    if seconds_per_batch < 0:
-        logging.warning("seconds_per_batch cannot be negative, using default value")
-        seconds_per_batch = defaults["seconds_per_batch"]
     
     if connection <= 0:
         logging.warning("connection must be positive, using default value")
@@ -176,8 +165,6 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
         rotate_per_smtp = defaults["rotate_per_smtp"]
     
     return {
-        "emails_per_batch": emails_per_batch,
-        "seconds_per_batch": seconds_per_batch,
         "connection": connection,
         "wait_before_sending": wait_before_sending,
         "retry_if_error": retry_if_error,
@@ -199,6 +186,57 @@ def load_test_recipient(file_path: str = "test_recipient.txt") -> str:
         return "rahamtulla9@rediffmail.com"
     
     return test_email
+
+
+def remove_successful_recipient(email: str, file_path: str = "recipients.txt"):
+    """Remove a successfully sent email from the recipients file."""
+    try:
+        # Read all current recipients
+        if not os.path.exists(file_path):
+            logging.warning(f"Recipients file not found: {file_path}")
+            return
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            all_recipients = [line.strip() for line in f if line.strip()]
+        
+        # Remove the successfully sent email (case-insensitive)
+        original_count = len(all_recipients)
+        updated_recipients = [recipient for recipient in all_recipients if recipient.lower() != email.lower()]
+        
+        if len(updated_recipients) < original_count:
+            # Write back the updated list
+            with open(file_path, 'w', encoding='utf-8') as f:
+                for recipient in updated_recipients:
+                    f.write(recipient + '\n')
+            
+            logging.info(f"Removed {email} from recipients list. Remaining: {len(updated_recipients)}")
+        else:
+            logging.warning(f"Email {email} not found in recipients list for removal")
+            
+    except Exception as e:
+        logging.error(f"Error removing recipient {email}: {e}")
+
+
+def save_failed_recipient(email: str, error_info: str, file_path: str = "failed_recipients.txt"):
+    """Save failed email attempts to a separate file for later retry."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} | {email} | {error_info}\n")
+        logging.info(f"Logged failed send for {email} to {file_path}")
+    except Exception as e:
+        logging.error(f"Error logging failed recipient {email}: {e}")
+
+
+def save_successful_recipient(email: str, smtp_info: str, file_path: str = "send_success.txt"):
+    """Save successfully sent emails to a tracking file."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(f"{timestamp} | {email} | {smtp_info}\n")
+        logging.info(f"Logged successful send for {email} to {file_path}")
+    except Exception as e:
+        logging.error(f"Error logging successful recipient {email}: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -337,10 +375,8 @@ async def send_emails_with_advanced_features(
     rate_config: dict, 
     test_recipient: str
 ):
-    """Send emails with all advanced features: connection pooling, retries, rotation, rate limiting."""
+    """Send emails with all advanced features: connection pooling, retries, rotation, individual delays."""
     # Extract configuration
-    emails_per_batch = rate_config["emails_per_batch"]
-    seconds_per_batch = rate_config["seconds_per_batch"]
     connection_pool_size = rate_config["connection"]
     wait_before_sending = rate_config["wait_before_sending"]
     retry_if_error = rate_config["retry_if_error"]
@@ -352,7 +388,6 @@ async def send_emails_with_advanced_features(
     print(f"Starting advanced email campaign to {len(recipients)} recipients...")
     print(f"SMTP accounts: {len(smtp_configs)}")
     print(f"Connection pool: {connection_pool_size} simultaneous connections")
-    print(f"Rate limit: {emails_per_batch} email(s) every {seconds_per_batch}s")
     print(f"Individual delay: {wait_before_sending}s before each email")
     print(f"Retry attempts: {retry_if_error}")
     print(f"SMTP rotation: Every {rotate_per_smtp} emails")
@@ -411,25 +446,43 @@ async def send_emails_with_advanced_features(
             successful_sends += 1
             retry_info = f" (after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
             print(f"  ✓ Success{retry_info} - Duration: {result['duration_seconds']:.2f}s")
+            
+            # Remove successfully sent email from recipients file
+            remove_successful_recipient(recipient)
+            print(f"  📝 Removed {recipient} from recipients list")
+            
+            # Log successful email to success tracking file
+            smtp_info = f"SMTP #{current_smtp_index + 1}: {current_smtp.host}"
+            save_successful_recipient(recipient, smtp_info)
+            print(f"  ✅ Logged success to send_success.txt")
         else:
             failed_sends += 1
             retry_info = f" (failed after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
-            print(f"  ✗ Failed{retry_info} - {result['error_type']}: {result['error']}")
+            error_details = f"{result['error_type']}: {result['error']}"
+            print(f"  ✗ Failed{retry_info} - {error_details}")
+            
+            # Log failed email for potential retry later
+            save_failed_recipient(recipient, error_details)
         
-        # Apply batch rate limiting
-        if i % emails_per_batch == 0 and i < len(recipients):
-            if seconds_per_batch > 0:
-                print(f"  ⏳ Batch rate limiting: waiting {seconds_per_batch} second(s)...")
-                await asyncio.sleep(seconds_per_batch)
+        # No batch rate limiting - using only individual delays
     
     print("=" * 80)
     print(f"Campaign completed successfully!")
-    print(f"Successful sends: {successful_sends}")
-    print(f"Failed sends: {failed_sends}")
-    print(f"Total recipients: {len(recipients)}")
+    print(f"Successful sends: {successful_sends} (removed from recipients.txt, logged to send_success.txt)")
+    print(f"Failed sends: {failed_sends} (logged to failed_recipients.txt)")
+    print(f"Total recipients processed: {len(recipients)}")
     print(f"Test emails sent: {test_count}")
     print(f"SMTP accounts used: {len(smtp_configs)}")
     print(f"Final SMTP account: #{current_smtp_index + 1}")
+    
+    # Show remaining recipients count
+    try:
+        with open("recipients.txt", 'r', encoding='utf-8') as f:
+            remaining_count = len([line.strip() for line in f if line.strip()])
+        print(f"Remaining recipients in file: {remaining_count}")
+    except:
+        print("Could not check remaining recipients count")
+    
     return True
 
 
@@ -473,7 +526,6 @@ async def main():
         print(f"  - Retry attempts: {rate_config['retry_if_error']}")
         print(f"  - Individual delay: {rate_config['wait_before_sending']}s")
         print(f"  - SMTP rotation: Every {rate_config['rotate_per_smtp']} emails")
-        print(f"  - Batch rate limit: {rate_config['emails_per_batch']} email(s) every {rate_config['seconds_per_batch']}s")
         print()
         
         # Start advanced email campaign
@@ -494,6 +546,10 @@ async def main():
         print("  - letter.html (HTML email content)")
         print("  - rate_limit.json (rate limiting configuration - optional)")
         print("  - test_recipient.txt (test email address - optional, defaults to hardcoded)")
+        print()
+        print("Files created automatically:")
+        print("  - send_success.txt (log of successful email sends)")
+        print("  - failed_recipients.txt (log of failed email attempts)")
     except Exception as e:
         print(f"Unexpected error: {e}")
 
