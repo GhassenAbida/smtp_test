@@ -5,6 +5,7 @@ Sends HTML emails to multiple recipients with rate limiting.
 """
 
 import asyncio
+import argparse
 import json
 import logging
 import os
@@ -252,6 +253,27 @@ def load_test_recipient(file_path: str = "test_recipient.txt") -> str:
     return test_email
 
 
+def load_test_recipients_for_campaign(file_path: str = "test_recipient.txt") -> List[str]:
+    """Load all test recipient email addresses from text file for test campaign mode."""
+    if not os.path.exists(file_path):
+        logging.warning(f"Test recipient file not found: {file_path}, using hardcoded default")
+        return ["rahamtulla9@rediffmail.com"]
+    
+    test_recipients = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            email = line.strip()
+            if email and '@' in email:
+                test_recipients.append(email)
+    
+    if not test_recipients:
+        logging.warning("Test recipient file is empty, using hardcoded default")
+        return ["rahamtulla9@rediffmail.com"]
+    
+    logging.info(f"Loaded {len(test_recipients)} test recipients for test campaign")
+    return test_recipients
+
+
 def remove_successful_recipient(email: str, file_path: str = "recipients.txt"):
     """Remove a successfully sent email from the recipients file."""
     try:
@@ -272,8 +294,6 @@ def remove_successful_recipient(email: str, file_path: str = "recipients.txt"):
             with open(file_path, 'w', encoding='utf-8') as f:
                 for recipient in updated_recipients:
                     f.write(recipient + '\n')
-            
-            logging.info(f"Removed {email} from recipients list. Remaining: {len(updated_recipients)}")
         else:
             logging.warning(f"Email {email} not found in recipients list for removal")
             
@@ -297,7 +317,6 @@ def save_successful_recipient(email: str, smtp_info: str = None, file_path: str 
     try:
         with open(file_path, 'a', encoding='utf-8') as f:
             f.write(f"{email}\n")
-        logging.info(f"Logged successful send for {email} to {file_path}")
     except Exception as e:
         logging.error(f"Error logging successful recipient {email}: {e}")
 
@@ -530,12 +549,20 @@ def create_html_email_message(from_addr: str, from_name: str, to_addr: str, subj
     msg["List-Unsubscribe"] = f"<mailto:{unsubscribe_email}>, <https://unsubscribe.example.com/?email={to_addr}>"
     msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
     
-    # Create plain text version from HTML
-    plain_text = html_to_plain_text(html_content)
+    # Personalize HTML content with recipient's email and timestamp
+    # Replace the URL with personalized version containing recipient email and send time
+    current_timestamp = datetime.now().strftime("%d_%m_%Y_%H:%M")
+    personalized_html = html_content.replace(
+        'https://ofoxauto.de/access',
+        f'https://ofoxauto.de/access?ab={to_addr}&t={current_timestamp}'
+    )
+    
+    # Create plain text version from personalized HTML
+    plain_text = html_to_plain_text(personalized_html)
     
     # Set both plain text and HTML content (multipart/alternative)
     msg.set_content(plain_text)  # Plain text as primary content
-    msg.add_alternative(html_content, subtype="html")  # HTML as alternative
+    msg.add_alternative(personalized_html, subtype="html")  # HTML as alternative
     
     return msg
 
@@ -699,11 +726,9 @@ async def send_emails_with_advanced_features(
                 
                 # Remove successfully sent email from recipients file
                 remove_successful_recipient(recipient)
-                print(f"  📝 Removed {recipient} from recipients list")
                 
                 # Log successful email to success tracking file
                 save_successful_recipient(recipient)
-                print(f"  ✅ Logged success to send_success.txt")
             else:
                 failed_sends += 1
                 retry_info = f" (failed after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
@@ -754,8 +779,17 @@ async def send_emails_with_rate_limit(smtp_config: SMTPCredentials, recipients: 
 
 async def main():
     """Main function to run the email campaign."""
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="SMTP Email Campaign")
+    parser.add_argument("--test", action="store_true", help="Run in test mode - only send to addresses in test_recipient.txt")
+    args = parser.parse_args()
+    
     print("=" * 60)
-    print("SMTP Email Campaign")
+    if args.test:
+        print("SMTP Email Campaign - TEST MODE")
+        print("Only sending to addresses in test_recipient.txt")
+    else:
+        print("SMTP Email Campaign - PRODUCTION MODE")
     print("=" * 60)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -764,7 +798,15 @@ async def main():
         # Load configuration files
         print("Loading configuration files...")
         smtp_configs = load_smtp_config()
-        recipients = load_recipients()
+        
+        # Load recipients based on mode
+        if args.test:
+            recipients = load_test_recipients_for_campaign()
+            print(f"🧪 TEST MODE: Using test recipients from test_recipient.txt")
+        else:
+            recipients = load_recipients()
+            print(f"📧 PRODUCTION MODE: Using recipients from recipients.txt")
+        
         subject = load_subject()
         html_content = load_letter_html()
         rate_config = load_rate_limit_config()
@@ -776,7 +818,9 @@ async def main():
             print(f"  #{i}: {config.from_name} <{config.from_address}> via {config.host}:{config.port}")
         print(f"Subject: {subject}")
         print(f"Recipients loaded: {len(recipients)}")
-        print(f"Test recipient: {test_recipient}")
+        if args.test:
+            print(f"📧 Test mode recipients: {', '.join(recipients)}")
+        print(f"Test recipient for connection checks: {test_recipient}")
         print(f"Advanced features:")
         print(f"  - Connection pool: {rate_config['connection']} simultaneous connections")
         print(f"  - Retry attempts: {rate_config['retry_if_error']}")
@@ -798,7 +842,8 @@ async def main():
         print(f"Configuration error: {e}")
         print("Please ensure all required files exist:")
         print("  - smtp.json (SMTP configuration)")
-        print("  - recipients.txt (email addresses, one per line)")
+        if not args.test:
+            print("  - recipients.txt (email addresses, one per line)")
         print("  - subject.txt (email subject)")
         print("  - letter.html (HTML email content)")
         print("  - rate_limit.json (rate limiting configuration - optional)")
