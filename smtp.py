@@ -162,12 +162,9 @@ def load_letter_html(file_path: str = "letter.html") -> str:
 
 
 def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
-    """Load rate limiting configuration from JSON file."""
+    """Load simplified rate limiting configuration from JSON file."""
     defaults = {
-        "connection": 3,
         "wait_before_sending": 1.0,
-        "retry_if_error": 3,
-        "rotate_per_smtp": 100,
         "test_index": 500
     }
     
@@ -179,45 +176,20 @@ def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
         config = json.load(f)
     
     # Validate configuration with defaults
-    connection = config.get("connection", defaults["connection"])
     wait_before_sending = config.get("wait_before_sending", defaults["wait_before_sending"])
-    retry_if_error = config.get("retry_if_error", defaults["retry_if_error"])
-    rotate_per_smtp = config.get("rotate_per_smtp", defaults["rotate_per_smtp"])
     test_index = config.get("test_index", defaults["test_index"])
     
     # Validate values
-    
-    if connection <= 0:
-        logging.warning("connection must be positive, using default value")
-        connection = defaults["connection"]
-    elif connection > 10:
-        logging.warning("connection should not exceed 10 for stability, using 10")
-        connection = 10
-    
     if wait_before_sending < 0:
         logging.warning("wait_before_sending cannot be negative, using default value")
         wait_before_sending = defaults["wait_before_sending"]
-    
-    if retry_if_error < 0:
-        logging.warning("retry_if_error cannot be negative, using default value")
-        retry_if_error = defaults["retry_if_error"]
-    elif retry_if_error > 10:
-        logging.warning("retry_if_error should not exceed 10, using 10")
-        retry_if_error = 10
-    
-    if rotate_per_smtp <= 0:
-        logging.warning("rotate_per_smtp must be positive, using default value")
-        rotate_per_smtp = defaults["rotate_per_smtp"]
     
     if test_index <= 0:
         logging.warning("test_index must be positive, using default value")
         test_index = defaults["test_index"]
     
     return {
-        "connection": connection,
         "wait_before_sending": wait_before_sending,
-        "retry_if_error": retry_if_error,
-        "rotate_per_smtp": rotate_per_smtp,
         "test_index": test_index
     }
 
@@ -321,6 +293,88 @@ def save_successful_recipient(email: str, smtp_info: str = None, file_path: str 
         logging.error(f"Error logging successful recipient {email}: {e}")
 
 
+def save_errored_smtp_config(failed_config: SMTPCredentials, error_info: str, file_path: str = "erroned_smtp.json"):
+    """Save failed SMTP configuration to errored SMTP file."""
+    try:
+        # Create error entry with timestamp and error details
+        error_entry = {
+            "host": failed_config.host,
+            "port": failed_config.port,
+            "username": failed_config.username,
+            "password": failed_config.password,
+            "encryption": failed_config.encryption,
+            "from_address": failed_config.from_address,
+            "from_name": failed_config.from_name,
+            "error_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "error_details": error_info
+        }
+        
+        # Load existing errored SMTPs or create empty list
+        errored_smtps = []
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    errored_smtps = json.load(f)
+            except Exception as e:
+                logging.error(f"Error reading existing errored SMTPs: {e}")
+                errored_smtps = []
+        
+        # Add new error entry
+        errored_smtps.append(error_entry)
+        
+        # Save updated errored SMTPs
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(errored_smtps, f, indent=4)
+        
+        logging.info(f"Moved failed SMTP {failed_config.host} to {file_path}")
+        print(f"  📝 Saved failed SMTP to {file_path}: {failed_config.from_address}")
+        
+    except Exception as e:
+        logging.error(f"Error saving errored SMTP config: {e}")
+        print(f"  ⚠️  Error saving failed SMTP config: {e}")
+
+
+def remove_smtp_from_config(failed_config: SMTPCredentials, smtp_file_path: str = "smtp.json"):
+    """Remove failed SMTP configuration from smtp.json file."""
+    try:
+        # Load current SMTP configurations
+        with open(smtp_file_path, 'r', encoding='utf-8') as f:
+            smtp_configs = json.load(f)
+        
+        # Ensure it's a list
+        if not isinstance(smtp_configs, list):
+            smtp_configs = [smtp_configs]
+        
+        # Find and remove the failed configuration
+        original_count = len(smtp_configs)
+        smtp_configs = [
+            config for config in smtp_configs 
+            if not (
+                config["host"] == failed_config.host and 
+                config["from_address"] == failed_config.from_address and 
+                config["username"] == failed_config.username
+            )
+        ]
+        
+        if len(smtp_configs) < original_count:
+            # Save updated SMTP configurations
+            with open(smtp_file_path, 'w', encoding='utf-8') as f:
+                json.dump(smtp_configs, f, indent=4)
+            
+            logging.info(f"Removed failed SMTP {failed_config.host} from {smtp_file_path}")
+            print(f"  🗑️  Removed failed SMTP from {smtp_file_path}: {failed_config.from_address}")
+            print(f"  📊 Remaining SMTP accounts: {len(smtp_configs)}")
+            return True
+        else:
+            logging.warning(f"Failed SMTP {failed_config.host} not found in {smtp_file_path}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"Error removing SMTP from config: {e}")
+        print(f"  ⚠️  Error removing SMTP from config: {e}")
+        return False
+
+
 def generate_statistics(smtp_stats: dict, smtp_configs: List[SMTPCredentials], file_path: str = "statistics.txt"):
     """Generate statistics about SMTP usage and save to file."""
     try:
@@ -362,9 +416,9 @@ def generate_statistics(smtp_stats: dict, smtp_configs: List[SMTPCredentials], f
 class SMTPConnectionPool:
     """Manages a pool of persistent SMTP connections for efficient email sending."""
     
-    def __init__(self, smtp_configs: List[SMTPCredentials], pool_size: int = 1):
+    def __init__(self, smtp_configs: List[SMTPCredentials]):
         self.smtp_configs = smtp_configs
-        self.pool_size = pool_size
+        self.pool_size = len(smtp_configs)  # One connection per SMTP account
         self.connections = []
         self.current_index = 0
         self.lock = asyncio.Lock()
@@ -496,9 +550,37 @@ class SMTPConnectionPool:
                 "error": str(e), 
                 "error_type": type(e).__name__, 
                 "duration_seconds": duration,
-                "connection_id": conn['id']
+                "connection_id": conn['id'],
+                "connection_obj": conn  # Include connection object for removal
             }
             
+    async def remove_failed_connection(self, failed_conn, error_details: str = ""):
+        """Remove a failed connection from the pool and update smtp.json."""
+        async with self.lock:
+            if failed_conn in self.connections:
+                try:
+                    await failed_conn['smtp'].quit()
+                except:
+                    pass  # Ignore errors when closing failed connection
+                
+                # Get the SMTP config for this connection
+                failed_config = failed_conn['config']
+                
+                # Remove from connection pool
+                self.connections.remove(failed_conn)
+                print(f"  ❌ Removed failed connection #{failed_conn['id']} from pool")
+                print(f"  📊 Active connections remaining: {len(self.connections)}")
+                
+                # Save failed SMTP to erroned_smtp.json
+                save_errored_smtp_config(failed_config, error_details)
+                
+                # Remove failed SMTP from smtp.json
+                remove_smtp_from_config(failed_config)
+                
+                # Adjust current_index if needed
+                if self.current_index >= len(self.connections) and self.connections:
+                    self.current_index = 0
+    
     async def close_all(self):
         """Close all connections in the pool."""
         print("Closing SMTP connection pool...")
@@ -553,8 +635,8 @@ def create_html_email_message(from_addr: str, from_name: str, to_addr: str, subj
     # Replace the URL with personalized version containing recipient email and send time
     current_timestamp = datetime.now().strftime("%d_%m_%Y_%H:%M")
     personalized_html = html_content.replace(
-        'https://ofoxauto.de/access',
-        f'https://ofoxauto.de/access?ab={to_addr}&t={current_timestamp}'
+        'https://goviali.ro/access',
+        f'https://goviali.ro/access?ab={to_addr}&t={current_timestamp}'
     )
     
     # Create plain text version from personalized HTML
@@ -572,13 +654,14 @@ async def send_html_email_with_retry(
     to_addr: str,
     subject: str,
     html_content: str,
-    retry_count: int = 3,
     connection_semaphore: asyncio.Semaphore = None,
 ) -> dict:
     """Send HTML email with retry mechanism using connection pool."""
     last_error = None
+    max_connection_retries = 50  # Maximum retries for connection errors
     
-    for attempt in range(retry_count + 1):  # +1 for initial attempt
+    attempt = 0
+    while True:
         conn = None
         try:
             # Use connection semaphore if provided
@@ -604,20 +687,37 @@ async def send_html_email_with_retry(
             if conn:
                 await connection_pool.release_connection(conn)
         
-        # Wait before retry (exponential backoff)
-        if attempt < retry_count:
-            wait_time = min(2 ** attempt, 30)  # Cap at 30 seconds
+        # Check if this is a connection error
+        error_str = str(last_error.get('error', ''))
+        is_connection_error = (
+            "SMTPServerDisconnected" in last_error.get('error_type', '') and 
+            "Server not connected" in error_str
+        )
+        
+        # For connection errors, keep retrying up to max_connection_retries
+        if is_connection_error and attempt < max_connection_retries:
+            attempt += 1
+            wait_time = min(2 ** min(attempt, 6), 30)  # Cap exponential backoff
+            print(f"    🔄 Connection retry #{attempt} in {wait_time}s...")
             await asyncio.sleep(wait_time)
+            continue
+        
+        # For other errors, fail immediately (no retries - handled by graceful degradation)
+        elif not is_connection_error:
+            break
+        
+        # All retries exhausted
+        break
     
     # All retries failed
     if last_error:
-        last_error["retry_attempts"] = retry_count
+        last_error["retry_attempts"] = attempt
         return last_error
     else:
-        return {"success": False, "error": "Unknown error after retries", "retry_attempts": retry_count, "duration_seconds": 0}
+        return {"success": False, "error": "Unknown error after retries", "retry_attempts": attempt, "duration_seconds": 0}
 
 
-async def send_test_email(connection_pool: SMTPConnectionPool, test_recipient: str, subject: str, html_content: str, test_number: int, retry_count: int = 3) -> bool:
+async def send_test_email(connection_pool: SMTPConnectionPool, test_recipient: str, subject: str, html_content: str, test_number: int) -> bool:
     """Send a test email to verify connection is still working."""
     test_subject = subject  # Use the exact same subject as regular emails
     
@@ -627,8 +727,7 @@ async def send_test_email(connection_pool: SMTPConnectionPool, test_recipient: s
         connection_pool=connection_pool,
         to_addr=test_recipient,
         subject=test_subject,
-        html_content=html_content,
-        retry_count=retry_count
+        html_content=html_content
     )
     
     if result["success"]:
@@ -651,70 +750,69 @@ async def send_emails_with_advanced_features(
     rate_config: dict, 
     test_recipient: str
 ):
-    """Send emails with all advanced features: connection pooling, retries, rotation, individual delays."""
-    # Extract configuration
-    connection_pool_size = rate_config["connection"]
+    """Send emails with simplified configuration: one connection per SMTP account, round-robin rotation."""
+    # Extract simplified configuration
     wait_before_sending = rate_config["wait_before_sending"]
-    retry_if_error = rate_config["retry_if_error"]
-    rotate_per_smtp = rate_config["rotate_per_smtp"]
     test_index = rate_config["test_index"]
     
-    print(f"Starting advanced email campaign to {len(recipients)} recipients...")
-    print(f"SMTP accounts: {len(smtp_configs)}")
-    print(f"Connection pool: {connection_pool_size} persistent connections")
-    print(f"Individual delay: {wait_before_sending}s before each email")
-    print(f"Retry attempts: {retry_if_error}")
-    print(f"SMTP rotation: Every {rotate_per_smtp} emails")
-    print(f"Test email: Every {test_index} emails to {test_recipient}")
+    print(f"Starting email campaign to {len(recipients)} recipients...")
+    print(f"SMTP accounts: {len(smtp_configs)} (one connection per account)")
+    print(f"Email delay: {wait_before_sending}s between sends")
+    print(f"Rotation: Round-robin (1 email per SMTP account)")
+    print(f"Test frequency: Every {test_index} emails to {test_recipient}")
+    print(f"Graceful degradation: Remove failed connections and continue")
     print("=" * 80)
     
-    # Initialize SMTP connection pool
-    connection_pool = SMTPConnectionPool(smtp_configs, connection_pool_size)
+    # Initialize SMTP connection pool (one connection per SMTP account)
+    connection_pool = SMTPConnectionPool(smtp_configs)
     
     try:
         await connection_pool.initialize()
         
         # Create connection semaphore for limiting concurrent email sends
-        connection_semaphore = asyncio.Semaphore(connection_pool_size)
+        connection_semaphore = asyncio.Semaphore(len(smtp_configs))
         
         successful_sends = 0
         failed_sends = 0
         test_count = 0
         current_smtp_index = 0
     
-        for i, recipient in enumerate(recipients, 1):
+        i = 0
+        while i < len(recipients):
+            recipient = recipients[i]
+            current_position = i + 1
+            
             # Send test email every N regular emails (configurable)
-            if i % test_index == 0:
+            if current_position % test_index == 0:
                 test_count += 1
-                test_success = await send_test_email(connection_pool, test_recipient, subject, html_content, test_count, retry_if_error)
+                test_success = await send_test_email(connection_pool, test_recipient, subject, html_content, test_count)
                 
                 if not test_success:
-                    print(f"\n❌ TEST EMAIL FAILED! Stopping campaign at email #{i}")
-                    print(f"Last successful position: {i-1}")
+                    print(f"\n❌ TEST EMAIL FAILED! Stopping campaign at email #{current_position}")
+                    print(f"Last successful position: {current_position-1}")
                     print("=" * 80)
                     print(f"Campaign STOPPED due to test email failure!")
                     print(f"Successful sends: {successful_sends}")
                     print(f"Failed sends: {failed_sends}")
-                    print(f"Stopped at recipient: {i}/{len(recipients)}")
+                    print(f"Stopped at recipient: {current_position}/{len(recipients)}")
                     return False
                 
                 print(f"  ✅ Test passed, continuing with regular emails...")
             
             # Display current connection status
             conn_info = f"Pool: {len(connection_pool.connections)} connections"
-            print(f"[{i}/{len(recipients)}] Sending to: {recipient} ({conn_info})")
+            print(f"[{current_position}/{len(recipients)}] Sending to: {recipient} ({conn_info})")
             
             # Apply individual email delay before sending
             if wait_before_sending > 0:
                 await asyncio.sleep(wait_before_sending)
             
-            # Send email with retry and connection pooling
+            # Send email with connection pooling (round-robin rotation)
             result = await send_html_email_with_retry(
                 connection_pool=connection_pool,
                 to_addr=recipient,
                 subject=subject,
                 html_content=html_content,
-                retry_count=retry_if_error,
                 connection_semaphore=connection_semaphore
             )
             
@@ -729,6 +827,9 @@ async def send_emails_with_advanced_features(
                 
                 # Log successful email to success tracking file
                 save_successful_recipient(recipient)
+                
+                # Move to next recipient
+                i += 1
             else:
                 failed_sends += 1
                 retry_info = f" (failed after {result.get('retry_attempts', 0)} retries)" if result.get('retry_attempts', 0) > 0 else ""
@@ -738,8 +839,37 @@ async def send_emails_with_advanced_features(
                 
                 # Log failed email for potential retry later
                 save_failed_recipient(recipient, error_details)
-            
-            # No batch rate limiting - using only individual delays
+                
+                # Check if this is a connection error - if so, keep trying with the same recipient
+                if "SMTPServerDisconnected" in error_details and "Server not connected" in error_details:
+                    print(f"  🔄 Connection error detected - will retry same recipient: {recipient}")
+                    # Don't increment i, retry the same recipient
+                    continue
+                
+                    # For other SMTP errors, remove the failed connection and continue with remaining ones
+                else:
+                    print(f"  ⚠️  SMTP error on connection #{result.get('connection_id', '?')}: {error_details}")
+                    
+                    # Remove the failed connection from the pool using connection object
+                    failed_conn_obj = result.get('connection_obj')
+                    if failed_conn_obj:
+                        await connection_pool.remove_failed_connection(failed_conn_obj, error_details)
+                    
+                    # Check if we still have working connections
+                    if len(connection_pool.connections) == 0:
+                        print(f"\n❌ ALL SMTP CONNECTIONS FAILED! Stopping campaign at email #{current_position}")
+                        print(f"Last error: {error_details}")
+                        print(f"Last successful position: {current_position-1}")
+                        print("=" * 80)
+                        print(f"Campaign STOPPED - No working SMTP connections remaining!")
+                        print(f"Successful sends: {successful_sends}")
+                        print(f"Failed sends: {failed_sends}")
+                        print(f"Stopped at recipient: {current_position}/{len(recipients)}")
+                        return False
+                    else:
+                        print(f"  ✅ Continuing with {len(connection_pool.connections)} remaining connection(s)")
+                        # Move to next recipient
+                        i += 1            # No batch rate limiting - using only individual delays
         
         print("=" * 80)
         print(f"Campaign completed successfully!")
@@ -747,7 +877,7 @@ async def send_emails_with_advanced_features(
         print(f"Failed sends: {failed_sends} (logged to failed_recipients.txt)")
         print(f"Total recipients processed: {len(recipients)}")
         print(f"Test emails sent: {test_count}")
-        print(f"SMTP connection pool: {len(connection_pool.connections)} persistent connections")
+        print(f"Final active connections: {len(connection_pool.connections)} of {len(smtp_configs)} original")
         
         # Generate statistics
         generate_statistics(connection_pool.smtp_stats, smtp_configs)
@@ -821,12 +951,12 @@ async def main():
         if args.test:
             print(f"📧 Test mode recipients: {', '.join(recipients)}")
         print(f"Test recipient for connection checks: {test_recipient}")
-        print(f"Advanced features:")
-        print(f"  - Connection pool: {rate_config['connection']} simultaneous connections")
-        print(f"  - Retry attempts: {rate_config['retry_if_error']}")
-        print(f"  - Individual delay: {rate_config['wait_before_sending']}s")
-        print(f"  - SMTP rotation: Every {rate_config['rotate_per_smtp']} emails")
+        print(f"Configuration:")
+        print(f"  - Connections: {len(smtp_configs)} (one per SMTP account)")
+        print(f"  - Email delay: {rate_config['wait_before_sending']}s between sends")
+        print(f"  - Rotation: Round-robin (1 email per SMTP)")
         print(f"  - Test frequency: Every {rate_config['test_index']} emails")
+        print(f"  - Error handling: Graceful degradation (remove failed connections)")
         print()
         
         # Start advanced email campaign
