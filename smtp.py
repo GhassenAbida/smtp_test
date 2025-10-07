@@ -161,6 +161,22 @@ def load_letter_html(file_path: str = "letter.html") -> str:
         return f.read()
 
 
+def load_link(file_path: str = "link.txt") -> str:
+    """Load base URL from text file."""
+    if not os.path.exists(file_path):
+        logging.warning(f"Link file not found: {file_path}, using default")
+        return "https://goviali.ro/access"
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        link = f.read().strip()
+    
+    if not link:
+        logging.warning("Link file is empty, using default")
+        return "https://goviali.ro/access"
+    
+    return link
+
+
 def load_rate_limit_config(file_path: str = "rate_limit.json") -> dict:
     """Load simplified rate limiting configuration from JSON file."""
     defaults = {
@@ -294,19 +310,17 @@ def save_successful_recipient(email: str, smtp_info: str = None, file_path: str 
 
 
 def save_errored_smtp_config(failed_config: SMTPCredentials, error_info: str, file_path: str = "erroned_smtp.json"):
-    """Save failed SMTP configuration to errored SMTP file."""
+    """Save failed SMTP configuration to errored SMTP file using the standard config schema."""
     try:
-        # Create error entry with timestamp and error details
-        error_entry = {
+        # Persist the config in the same format as smtp.json
+        errored_entry = {
             "host": failed_config.host,
             "port": failed_config.port,
             "username": failed_config.username,
             "password": failed_config.password,
             "encryption": failed_config.encryption,
             "from_address": failed_config.from_address,
-            "from_name": failed_config.from_name,
-            "error_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "error_details": error_info
+            "from_name": failed_config.from_name
         }
         
         # Load existing errored SMTPs or create empty list
@@ -315,12 +329,20 @@ def save_errored_smtp_config(failed_config: SMTPCredentials, error_info: str, fi
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     errored_smtps = json.load(f)
+                    if isinstance(errored_smtps, dict):
+                        errored_smtps = [errored_smtps]
+                    elif not isinstance(errored_smtps, list):
+                        logging.warning(f"Unexpected data format in {file_path}, resetting file")
+                        errored_smtps = []
             except Exception as e:
                 logging.error(f"Error reading existing errored SMTPs: {e}")
                 errored_smtps = []
         
-        # Add new error entry
-        errored_smtps.append(error_entry)
+        # Add new error entry if it is not already present
+        if errored_entry not in errored_smtps:
+            errored_smtps.append(errored_entry)
+        else:
+            logging.info(f"Failed SMTP {failed_config.host} already logged in {file_path}")
         
         # Save updated errored SMTPs
         with open(file_path, 'w', encoding='utf-8') as f:
@@ -328,6 +350,8 @@ def save_errored_smtp_config(failed_config: SMTPCredentials, error_info: str, fi
         
         logging.info(f"Moved failed SMTP {failed_config.host} to {file_path}")
         print(f"  📝 Saved failed SMTP to {file_path}: {failed_config.from_address}")
+        if error_info:
+            logging.info(f"Failure details for {failed_config.host}: {error_info}")
         
     except Exception as e:
         logging.error(f"Error saving errored SMTP config: {e}")
@@ -620,24 +644,36 @@ def html_to_plain_text(html_content: str) -> str:
 
 def create_html_email_message(from_addr: str, from_name: str, to_addr: str, subject: str, html_content: str) -> EmailMessage:
     """Create email message with both HTML and plain text versions for better deliverability."""
+    from email.utils import formatdate, make_msgid
+    
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = f"{from_name} <{from_addr}>"
     msg["To"] = to_addr
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain=from_addr.split('@')[1])
+    msg["Reply-To"] = "billing@takeatest.net"
     
-    # Add List-Unsubscribe header (required for bulk email)
-    # This allows recipients to easily unsubscribe from your mailing list
+    # Add List-Unsubscribe header (recommended for all email types)
+    # This allows recipients to easily unsubscribe and reduces spam complaints
     unsubscribe_email = f"unsubscribe+{to_addr.replace('@', '=').replace('.', '_')}@{from_addr.split('@')[1]}"
-    msg["List-Unsubscribe"] = f"<mailto:{unsubscribe_email}>, <https://unsubscribe.example.com/?email={to_addr}>"
+    msg["List-Unsubscribe"] = f"<mailto:{unsubscribe_email}>, <https://takeatest.net/unsubscribe?email={to_addr}>"
     msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
     
     # Personalize HTML content with recipient's email and timestamp
     # Replace the URL with personalized version containing recipient email and send time
     current_timestamp = datetime.now().strftime("%d_%m_%Y_%H:%M")
-    personalized_html = html_content.replace(
-        'https://goviali.ro/access',
-        f'https://goviali.ro/access?ab={to_addr}&t={current_timestamp}'
-    )
+    base_link = load_link()  # Load base URL from link.txt
+    
+    # Replace any existing href links with the personalized version from link.txt
+    # This pattern matches href="any_url" and replaces it with the link from link.txt + personalization
+    import re
+    href_pattern = r'href="[^"]*"'
+    personalized_link = f'href="{base_link}?ab={to_addr}&t={current_timestamp}"'
+    personalized_html = re.sub(href_pattern, personalized_link, html_content)
+    
+    # If no href links were found, the HTML remains unchanged (which is fine for templates without links)
+    # The personalization will still work for any future templates that include links
     
     # Create plain text version from personalized HTML
     plain_text = html_to_plain_text(personalized_html)
@@ -941,6 +977,7 @@ async def main():
         html_content = load_letter_html()
         rate_config = load_rate_limit_config()
         test_recipient = load_test_recipient()
+        base_link = load_link()  # Load base URL for personalization
         
         # Display configuration summary
         print(f"SMTP accounts: {len(smtp_configs)}")
@@ -951,6 +988,7 @@ async def main():
         if args.test:
             print(f"📧 Test mode recipients: {', '.join(recipients)}")
         print(f"Test recipient for connection checks: {test_recipient}")
+        print(f"Base URL for personalization: {base_link}")
         print(f"Configuration:")
         print(f"  - Connections: {len(smtp_configs)} (one per SMTP account)")
         print(f"  - Email delay: {rate_config['wait_before_sending']}s between sends")
@@ -976,6 +1014,7 @@ async def main():
             print("  - recipients.txt (email addresses, one per line)")
         print("  - subject.txt (email subject)")
         print("  - letter.html (HTML email content)")
+        print("  - link.txt (base URL for personalization - optional, defaults to goviali.ro)")
         print("  - rate_limit.json (rate limiting configuration - optional)")
         print("  - test_recipient.txt (test email address - optional, defaults to hardcoded)")
         print()
