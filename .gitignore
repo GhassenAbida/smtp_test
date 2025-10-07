@@ -1,6 +1,7 @@
 # Configuration files (contain sensitive data)
 smtp.json
 rate_limit.json
+erroned_smtp.json
 
 # Email content files
 *.html
